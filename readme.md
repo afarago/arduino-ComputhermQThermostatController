@@ -13,8 +13,6 @@ You need the following list of hardware
 3. Hope RFM217W-868S1 868MHz, RF Receiver, OOK
 4. DHT22 Digital Temperature and Humidity Temperature Sensor
 
-![module connections](./doc/d1computherm_wiring.jpg "module connections")
-
 Connections:
 
     D1_MINI    RFM117W    RFM217W    DHT22       10K_Ohm_pullup_resistor
@@ -24,6 +22,8 @@ Connections:
     D1         -          DATA       -            -
     D2         DATA       -          -            -
     D3         -          -          DATA(pin2)  PIN1
+
+![module connections](./doc/d1computherm_wiring.jpg "module connections")
 
 ## FEATURES
 * Reads the state of Computherm Q thermostats throu RF and 
