@@ -1,9 +1,8 @@
 # ComputhermQThermostat Arduino controller
 
-This is an ESPHome custom component which allows you to control a Computherm/Delta Q7RF/Q8RF receiver equiped furnace using a TI CC1101 transceiver module. This component defines a switch platform for state toggling and a service for pairing.
+This is an Arduino D1 Mini project which allows you to control a Computherm Q7RF/Q8RF receiver equiped using a RFM117W transmitter and RFM217W receiver module.
 
-based on the work of denxhun, flogi, nistvan86
-by Attila Farago, 2021
+by Attila Farago, 2021 based on the work of denxhun, flogi, nistvan86
 
 **Use this project at your own risk. Reporting and/or fixing issues is always welcome.**
 

@@ -10,8 +10,8 @@
  *  based on the work of denxhun, flogi, nistvan86
  *  by Attila Farago, 2021
  *
- *  This is an Arduino D1 Mini project that allows reading multiple Computherm Q thermostats and 
- *  furthermore create, control virtual thermostats.
+ *  This is an Arduino D1 Mini project which allows you to control a Computherm Q7RF/Q8RF receiver 
+ *  using a RFM117W transmitter and RFM217W receiver module.
  */
 
 ////---------- ComputhermQThermostat class forward declaration ----------//
