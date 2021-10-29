@@ -13,6 +13,8 @@ You need the following list of hardware
 3. Hope RFM217W-868S1 868MHz, RF Receiver, OOK
 4. DHT22 Digital Temperature and Humidity Temperature Sensor
 
+[module connections](./doc/d1computherm_wiring.jpg)
+
 Connections:
 
     D1_MINI    RFM117W    RFM217W    DHT22       10K_Ohm_pullup_resistor
