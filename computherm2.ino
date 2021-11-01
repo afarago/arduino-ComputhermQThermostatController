@@ -1,9 +1,17 @@
 #include <Arduino.h>
 #include <ESP8266WiFi.h>
+#include <ESP8266WebServer.h>
+#include <WiFiUdp.h>
 #include <PubSubClient.h>
 #include <DHTesp.h>
+#include <NTPClient.h>
+#include <ArduinoOTA.h>
+#include <TimeLib.h>
+#include <LittleFS.h>
 #include <computhermrf.h>
 #include "arduino_secrets.h"
+
+#define PROJECT_NAME "WIFITO868GW"
 
 /*
  * ComputhermQThermostat controller
@@ -19,33 +27,39 @@
 class ComputhermQThermostat {
   public:
     ComputhermQThermostat();
-    void setup(String device_sid, bool readonly, int idx_channel);
+    void setup(const char* device_sid, bool readonly, int idx_channel, const char* description);
     void update();
     void on_pairing();
-    String device_id();
     void set_state_update_rf(bool state);
     void set_state_update_mqtt(bool state);
-    bool readonly();
+    const char* get_device_id();
+    bool get_readonly();
+    bool get_state();
+    const char* get_description();
 
   public:
-    void set_config_device_sid(String value);
+    String getjson();
 
-  private:
+  //!!private:
+  public:
     unsigned int idx_channel_ = 0;
     unsigned long last_msg_time_ = 0;
     unsigned long last_display_time_ = 0;
-    bool state_ = false;
-    bool config_readonly_ = true;
-    String config_device_sid_;
-    uint16_t config_resend_interval_ = 60000;
 
-    uint8_t pending_msg_ = 0;
+    bool state_ = false;
     bool initialized_ = false;
+    uint8_t pending_msg_ = 0; // 0 = MSG_NONE
+    unsigned long last_change_timestamp = 0;
+
+    bool config_readonly_ = true;
+    const char* config_device_sid_;
+    const char* config_device_description_;
+    uint16_t config_resend_interval_ = 60000;
 
   private:
     void send_msg(uint8_t msg);
+    bool update_state(bool newstate);
     void display_blink_led();
-    void initialize_mqtt_config();
 };
 
 ////---------- ARDUINO MAIN ----------//
@@ -59,7 +73,10 @@ void setup() {
   // Set software serial baud to 115200;
   Serial.begin(115200);
   delay(200);
-  Serial.println("Computherm radio detector and MQTT handler (wifito868gw) by afarago, based on the work of denxhun, flogi, nistvan86.");
+  Serial.println(F("Computherm radio detector and MQTT handler (wifito868gw) by afarago, based on the work of denxhun, flogi, nistvan86."));
+
+  // LittleFs
+  littlefs_setup();
 
   // setup and connect RF handler
   rfhandler_setup();
@@ -76,26 +93,44 @@ void setup() {
   mqtthandler_setup(String(WiFi.macAddress()));
   mqtthandler_ensure_connected();
 
+  // setup NTP
+  ntphandler_setup_wait_connected();
+
   // setup thermostats
   computhermqhandler_setup();
+
+  // OTA handler
+  otahandler_setup();
 
   // finish setup and shut down LED
   LED(false);
 }
 
 void loop() {
-  mqtthandler_loop();
-  rfhandler_loop();
-  computhermqhandler_loop();
+  if (!otahandler_isupdating()) {
+    wifihandler_loop();
+    mqtthandler_loop();
+    rfhandler_loop();
+    ntphandler_loop();
+    computhermqhandler_loop();
+    dht22handler_loop();
+    otahandler_loop();
+  }
 
   delay(100);
-
-  dht22handler_loop();
 }
 
 ////---------- UTILITIES ----------//
 void LED(bool on) {
   digitalWrite(BUILTIN_LED, on ? LOW : HIGH);
+}
+
+void LED_blink(int count) {
+  for (int i=0; i<count; i++) {
+    LED(true); delay(100);
+    LED(false); delay(50);
+  }
+  delay(300);
 }
 
 unsigned long calculate_diff(long now, long last_update) {  
@@ -108,6 +143,98 @@ unsigned long calculate_diff(long now, long last_update) {
     diff = now - last_update;
   }
   return diff;
+}
+
+const char* ONOFF(bool state) {
+  return state ? "ON" : "OFF";
+}
+
+bool isONOFF(const char *state) {
+  return (strcmp(state,"ON")==0) ? 1 : 0;
+}
+
+const char* TRUEFALSE(bool value) {
+  return value ? "true" : "false";
+}
+
+//////---------- LittleFS handler ----------//
+bool littlefs_setup() {
+  bool result = LittleFS.begin();
+  return result;
+}
+
+//////---------- OTA handler ----------//
+bool ota_updating = false;
+bool otahandler_isupdating() {
+  return ota_updating;
+}
+
+void otahandler_setup() {
+  ArduinoOTA.setHostname(PROJECT_NAME);
+//  ArduinoOTA.setPassword(XXX);
+  ArduinoOTA.onStart([]() {
+    Serial.println(F("OTA Start"));
+    LittleFS.end();
+    ota_updating = true;
+  });
+  ArduinoOTA.onEnd([]() {
+    Serial.println(F("\nOTA End"));
+    //ESP.restart();
+    //WDT - After a serial upload, the ESP must be manually reset before an OTA can work (actually, I think before a software reset as well).
+    ota_updating = false;
+  });
+  ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
+    unsigned int progresspc = progress / (total / 100);
+    Serial.printf("OTA Progress: %u%%\r", progresspc);
+    LED(progresspc % 2 == 0);
+  });
+  ArduinoOTA.onError([](ota_error_t error) {
+    Serial.printf("Error[%u]: ", error);
+//    if (error == OTA_AUTH_ERROR) Serial.println("Auth Failed");
+//    else if (error == OTA_BEGIN_ERROR) Serial.println("Begin Failed");
+//    else if (error == OTA_CONNECT_ERROR) Serial.println("Connect Failed");
+//    else if (error == OTA_RECEIVE_ERROR) Serial.println("Receive Failed");
+//    else if (error == OTA_END_ERROR) Serial.println("End Failed");
+  });
+  ArduinoOTA.begin();
+}
+  
+void otahandler_loop() {
+  ArduinoOTA.handle();
+}
+
+//////---------- NTP handler ----------//
+WiFiUDP ntpUDP;
+NTPClient timeClient(ntpUDP);
+const long utcOffsetInSeconds = 3600;
+unsigned long ntphandler_startupTime = 0;
+
+void ntphandler_setup_wait_connected() {
+  timeClient.setTimeOffset(utcOffsetInSeconds);
+  timeClient.begin();
+
+  // wait4validtime
+//  timeClient.forceUpdate();
+  Serial.print(F("Setting up NTP"));
+  while (timeClient.getEpochTime()<utcOffsetInSeconds*2) {
+    delay(100);
+    timeClient.update();
+    Serial.print(F("."));
+  }
+  Serial.println(F("\n"));
+  ntphandler_startupTime = timeClient.getEpochTime();
+}
+
+void ntphandler_loop() {
+  timeClient.update();
+}
+
+String ntphandler_getFormattedTime() {
+  return timeClient.getFormattedTime();
+}
+
+long unsigned ntphandler_getEpochTime () {
+  return timeClient.getEpochTime();
 }
 
 ////---------- DHT22 handler ----------//
@@ -123,12 +250,24 @@ void dht22handler_loop() {
   long now = millis();
   if ( calculate_diff(now, dht22handler_last_update) > dht22handler_update_delay ) {
     dht22handler_last_update = now;
-    float h = dht.getHumidity();
-    float t = dht.getTemperature();
 
-    String payload = "{\"temp\": " + String(t,2) + ", \"humidity\": " + String(h,2) + "}";
+    String payload = dht22handler_getjson();
     mqtthandler_send_sensor_update(payload);
   }
+}
+
+String dht22handler_getjson() {
+  float h = dht.getHumidity();
+  float t = dht.getTemperature();
+  String payload = 
+    "{\"temp\":" + String(t,2) + 
+    ",\"humidity\":" + String(h,2) + 
+    ",\"uptime\":" + (int)(millis()/1000) + 
+    ",\"time\":\"" + ntphandler_getFormattedTime() + "\""
+    ",\"unixtime\":\"" + ntphandler_getEpochTime() + "\""
+    ",\"freeheap\":\"" + String(ESP.getFreeHeap()) + "\""
+    "}";
+  return payload;
 }
 
 ////---------- WiFi handler ----------//
@@ -136,6 +275,7 @@ static const char *wifihandler_ssid = SECRET_WIFI_SSID;
 static const char *wifihandler_password = SECRET_WIFI_PASSWORD;
 WiFiClient wifihandler_espClient;
 WiFiEventHandler gotIpEventHandler; //, disconnectedEventHandler;
+ESP8266WebServer server(80);   //instantiate server at port 80 (http port)
 
 //const char* wl_status_to_string(wl_status_t status) {
 //  switch (status) {
@@ -160,6 +300,27 @@ void wifihandler_setup() {
 //  {
 //    Serial.println("WIFI disconnected");
 //  });
+
+  server.on("/status", [](){
+    String payload = 
+      "{\"sensor\":"+dht22handler_getjson() + 
+        ","+
+        "\"computherm\":"+computhermqhandler_getjson() + 
+      "}";
+    server.send(200, "application/json", payload);
+  });
+  server.on("/sensor", [](){
+    String payload = dht22handler_getjson();
+    server.send(200, "application/json", payload);
+  });
+  server.on("/computherm", [](){
+    String payload = computhermqhandler_getjson();
+    server.send(200, "application/json", payload);
+  });
+  server.on("/restart", [](){
+    ESP.restart();
+  });
+  server.begin();
 }
 
 void wifihandler_connect() {
@@ -168,12 +329,13 @@ void wifihandler_connect() {
   delay(1);
 
   // connect wifi
+  WiFi.hostname(PROJECT_NAME);
   WiFi.begin(wifihandler_ssid, wifihandler_password);
-  Serial.println("WIFI connecting...");
+  Serial.println(F("WIFI connecting..."));
 }
 
 void wifihandler_wait_connected() {
-  while (WiFi.status() != WL_CONNECTED) { 
+  while (!wifihandler_connected()) { 
     delay(500); 
   }
 }
@@ -192,6 +354,10 @@ void wifihandler_ensure_connected() {
 void wifihandler_disconnect() {
   WiFi.disconnect();
   WiFi.forceSleepBegin();
+}
+
+void wifihandler_loop() {
+  server.handleClient();
 }
 
 ////---------- MQTT PubSubHandler ----------//
@@ -216,7 +382,6 @@ static const unsigned char mqtt_availability_message_online[] = "online";
 static const char mqtt_wildcard_wildcard[] = "/+";
 static const char mqtt_status_subtopic[] = "/status";
 static const char mqtt_control_subtopic[] = "/control";
-static const char mqtt_config_subtopic[] = "/config";
 static const char mqtt_pair_subtopic[] = "/pair";
 
 void mqtthandler_setup(String mac_address) {
@@ -276,34 +441,9 @@ void mqtthandler_sendstatus(String ttid, String payload) {
     topicmod += ttid;
     topicmod += mqtt_status_subtopic;
   
-    char topicattrib[100];
-    topicmod.toCharArray( topicattrib, 100 );
-    unsigned char payloadattrb[100];
-    payload.getBytes( payloadattrb, 100 );
-  
-    LED(true);
-    Serial.printf("MQTT send topic: %s, Message: %s\n", topicattrib, payloadattrb);
+    Serial.printf("MQTT send topic: %s, Message: %s\n", topicmod.c_str(), payload.c_str());
     //mqtthandler_ensure_connected();
-    mqtthandler_pubsubclient.publish(topicattrib, payloadattrb, payload.length(), true);
-    delay(100); 
-    LED(false);
-  }
-}
-
-void mqtthandler_initconfig(String ttid, String payload) {
-  if (mqtthandler_connected()) {
-    String topicmod = mqtt_computherm_topic;
-    topicmod += "/";
-    topicmod += ttid;
-    topicmod += mqtt_config_subtopic;
-
-    char topicattrib[100];
-    topicmod.toCharArray( topicattrib, 100 );
-    unsigned char payloadattrb[100];
-    payload.getBytes( payloadattrb, 100 );
-
-    Serial.printf("MQTT init config topic: %s, Message: %s\n", topicattrib, payloadattrb);
-    mqtthandler_pubsubclient.publish(topicattrib, payloadattrb, payload.length(), true);
+    mqtthandler_pubsubclient.publish(topicmod.c_str(), (const uint8_t*)payload.c_str(), payload.length(), true);
   }
 }
 
@@ -325,19 +465,19 @@ void mqtthandler_callback(char *topic, byte *payload, unsigned int length) {
     topicstr.c_str(), actionverb.c_str(), message.c_str());
 
   // check if instance exists and if is not readonly otherwise skip
-  ComputhermQThermostat *thermo = computhermqhandler_findbyid(ttid);
+  ComputhermQThermostat *thermo = computhermqhandler_findbyid(ttid.c_str());
 
   if (!thermo) {
-    Serial.println("MQTT unregistered thermostat - skipping control command");
+    Serial.println(F("MQTT unregistered thermostat - skipping control command"));
   
   } else {  
     // update computherm by RF sender:
     if (actionverb == mqtt_control_subtopic) {
-      if (thermo->readonly()) {
-        Serial.println("MQTT read-only thermostat - skipping control command");
+      if (thermo->get_readonly()) {
+        Serial.println(F("MQTT read-only thermostat - skipping control command"));
         
       } else {
-        bool vez = (message == "ON") ? 1 : 0;
+        bool vez = isONOFF(message.c_str());
         
         // update through RF
         thermo->set_state_update_rf(vez);
@@ -354,14 +494,10 @@ void mqtthandler_callback(char *topic, byte *payload, unsigned int length) {
 
 void mqtthandler_send_sensor_update(String payload) {
   if (mqtthandler_connected()) {
-    unsigned char payloadattrb[100];
-    payload.getBytes( payloadattrb, 100 );
-  
-    Serial.printf("MQTT send sensor update: %s, Message: %s\n", mqtt_sensor_topic, payloadattrb);
-    mqtthandler_pubsubclient.publish(mqtt_sensor_topic, payloadattrb, payload.length(), false);
+    Serial.printf("MQTT send sensor update: %s, Message: %s\n", mqtt_sensor_topic, payload.c_str());
+    mqtthandler_pubsubclient.publish(mqtt_sensor_topic, (const uint8_t*)payload.c_str(), payload.length(), false);
   }
 }
-
 
 void mqtthandler_loop() {
   if (mqtthandler_connected()) {
@@ -373,21 +509,25 @@ void mqtthandler_loop() {
     long now = millis();
     
     // reconnect in a nonblocking way
-    if (now - mqtthandler_lastconnectattempt > 10000) {
+    if (calculate_diff(now, mqtthandler_lastconnectattempt) > 10000) {
+      // attempt to reconnect every 10 sec
+      mqtthandler_lastconnectattempt = now;
+
       if (wifihandler_connected()) {
-        mqtthandler_lastconnectattempt = now;
-        // attempt to reconnect every 10 sec
         if (mqtthandler_connect()) {
           mqtthandler_lastconnectattempt = 0;
           return;
         }
+      }
+      else {
+        wifihandler_connect(); //!! check if neccessary, what happens if WIFI disconnects
       }
     }
 
     // if no MQTT connection in like 60 sec -- turn off any manual switches
     if ((now - mqtthandler_lastconnected > mqtthandler_connection_timeout_rf_shutdown) && 
           !mqtthandler_manual_shutdown_sent) {
-      Serial.println("MQTT disconnection timeout - manually shutdown all non readonly thermostats");
+      Serial.println(F("MQTT disconnection timeout - manually shutdown all non readonly thermostats"));
       mqtthandler_manual_shutdown_sent = true;
       computhermqhandler_shutdown_all_non_readonly();
     }
@@ -400,22 +540,23 @@ void rfhandler_setup() {
   pinMode(D1, OUTPUT);
   pinMode(D2, OUTPUT);
   rfhandler_rf.startReceiver();
-  Serial.println("Computherm receiver started.");
+  Serial.println(F("Computherm receiver started."));
 }
 
 void rfhandler_loop() {
   if (rfhandler_rf.isDataAvailable()) {
 //    last_RFMessage_millis = currentMillis; //TODO: apply and trigger on last change only
     computhermMessage msg = rfhandler_rf.getData();
-    Serial.println("RF New message caught. Address: " + msg.address + " command: " + msg.command);
+    Serial.printf("RF New message caught. Address: %s command: %s\n", msg.address, msg.command);
 
-    ComputhermQThermostat *thermo = computhermqhandler_findbyid(msg.address);
+    ComputhermQThermostat *thermo = computhermqhandler_findbyid(msg.address.c_str());
     if (!thermo) {
-      Serial.println("MQTT unregistered thermostat - still registering data over MQTT");
-      mqtthandler_sendstatus(msg.address, msg.command);
+//      Serial.println(F("MQTT unregistered thermostat - still registering data over MQTT"));
+//      mqtthandler_sendstatus(msg.address, msg.command);
+      Serial.println(F("MQTT unregistered thermostat - skipping"));
       
     } else {
-      thermo->set_state_update_mqtt(msg.command == "ON");
+      thermo->set_state_update_mqtt(isONOFF(msg.command.c_str()));
     }
   }
 }
@@ -433,27 +574,39 @@ ComputhermQThermostat::ComputhermQThermostat() {
   
 }
 
-String ComputhermQThermostat::device_id() {
+const char* ComputhermQThermostat::get_device_id() {
   return this->config_device_sid_;
 }
 
-bool ComputhermQThermostat::readonly() {
+bool ComputhermQThermostat::get_readonly() {
   return this->config_readonly_;
 }
 
-void ComputhermQThermostat::setup(String device_sid, bool readonly, int idx_channel) {
+bool ComputhermQThermostat::get_state() {
+  return this->state_;
+}
+const char *ComputhermQThermostat::get_description() {
+  return this->config_device_description_;
+}
+
+void ComputhermQThermostat::setup(const char* device_sid, bool readonly, int idx_channel, const char* description) {
   this->config_device_sid_ = device_sid;
+  this->config_device_description_ = description;
   this->config_readonly_ = readonly;
   this->idx_channel_ = idx_channel;
-
   // Revert switch to off state
   this->state_ = false;
-  this->initialized_ = true;
 
-  //TODO: reset radio?
+  // Read from LittleFs
+  String filename = "/"+String(this->config_device_sid_);
+  File devfile = LittleFS.open(filename, "r"); //TODO: use F() macro //!!
+  if (devfile){
+    String lastchanges = devfile.readString(); //readStringUntil, file.readbytes(buffer, length),  file.write(buffer, length) 
+    last_change_timestamp = atol(lastchanges.c_str());
+    devfile.close();
+  }
 
-  // initialize mqtt configchannel and state
-  this->initialize_mqtt_config();
+  // initialize mqtt state
   this->set_state_update_mqtt(this->state_);
   
   // update through RF - will be auto updated on repeat for OFF, if there is no other control
@@ -461,52 +614,62 @@ void ComputhermQThermostat::setup(String device_sid, bool readonly, int idx_chan
     // send current state (OFF) via RF
     this->set_state_update_rf(this->state_);
   }
-}
 
-void ComputhermQThermostat::set_config_device_sid(String value) {
-  this->config_device_sid_ = value;
+  this->initialized_ = true;
 }
 
 void ComputhermQThermostat::update() {
-  if (this->initialized_) {
-    if (this->pending_msg_ != MSG_NONE) {
-      // Send prioritized message
-      this->send_msg(this->pending_msg_);
-      this->pending_msg_ = MSG_NONE;
-      
-    } else if (!this->config_readonly_) {
-      // resend message over RF - if thermostat is not read only
-      unsigned long now = millis();
+  if (this->pending_msg_ != MSG_NONE) {
+    // Send prioritized message
+    this->send_msg(this->pending_msg_);
+    this->pending_msg_ = MSG_NONE;
+    
+  } else if (!this->config_readonly_) {
+    // resend message over RF - if thermostat is not read only
+    unsigned long now = millis();
 
-      // Check if we have to resend current state by now
-      if ( calculate_diff(now, this->last_msg_time_) > this->config_resend_interval_ ) {
-        uint8_t msg = this->state_ ? MSG_HEAT_ON : MSG_HEAT_OFF;
-        this->send_msg(msg);
-      }
-
-      // if thermostat is ON, blink LED to show state X times
-      if ( calculate_diff(now, last_display_time_) > 10000 ) {
-        display_blink_led();
-        last_display_time_ = now;
-      }
+    // Check if we have to resend current state by now
+    if ( calculate_diff(now, this->last_msg_time_) > this->config_resend_interval_ ) {
+      uint8_t msg = this->state_ ? MSG_HEAT_ON : MSG_HEAT_OFF;
+      this->send_msg(msg);
     }
-  }  
+
+    // if thermostat is ON, blink LED to show state X times
+    if ( calculate_diff(now, last_display_time_) > 10000 ) {
+      if (this->state_) display_blink_led();
+      last_display_time_ = now;
+    }
+  }
+}
+
+bool ComputhermQThermostat::update_state(bool newstate) {
+  if (this->state_ == newstate) return false;
+
+  this->state_ = newstate;
+  last_change_timestamp = ntphandler_getEpochTime();
+
+  // Write to LittleFs
+  String filename = "/"+String(this->config_device_sid_);
+  File devfile = LittleFS.open(filename, "w");
+  if (devfile){
+    devfile.print(last_change_timestamp);
+    devfile.close();
+  }
+
+  // if thermostat is ON, blink LED to show state X times
+  if (newstate) this->display_blink_led();
+
+  return true;
 }
 
 void ComputhermQThermostat::display_blink_led() {
-  if (this->state_) {
-    for (int i=0; i<=idx_channel_; i++) {
-      LED(true); delay(100);
-      LED(false); delay(50);
-    }
-    delay(300);
-  }
+  LED_blink(this->idx_channel_+1);
 }
 
 void ComputhermQThermostat::send_msg(uint8_t msg) {
   if (msg == MSG_NONE) return;
 
-  Serial.printf("RF: Sending message: 0x%02x for %d:%s\n", msg, this->idx_channel_, this->config_device_sid_.c_str());
+  Serial.printf("RF Sending message: 0x%02x for %d:%s\n", msg, this->idx_channel_, this->config_device_sid_);
 
   for (int i = 0; i < rf_repeat_count; i++) {
     switch (msg) {
@@ -525,48 +688,50 @@ void ComputhermQThermostat::send_msg(uint8_t msg) {
   this->last_msg_time_ = millis();
 }
 
-void ComputhermQThermostat::initialize_mqtt_config() {
-  if (this->initialized_) {
-    String readonly_str = this->config_readonly_ ? "true" : "false";
-    String payload = "{\"readonly\": " + readonly_str + "}";
-    mqtthandler_initconfig(this->config_device_sid_, payload);
-  }
-}
-
 void ComputhermQThermostat::set_state_update_mqtt(bool state) {
-  if (this->initialized_) {
-    this->state_ = state;
-    String command = state ? "ON" : "OFF";
-    mqtthandler_sendstatus(this->config_device_sid_, command.c_str()); 
-  }
+  update_state(state);
+  
+  String command = this->getjson();
+  mqtthandler_sendstatus(config_device_sid_, command); 
 }
 
 void ComputhermQThermostat::set_state_update_rf(bool state) {
-  if (this->initialized_) {
-    this->state_ = state;
-    this->pending_msg_ = state ? MSG_HEAT_ON : MSG_HEAT_OFF;
+  update_state(state);
 
-    // if thermostat is ON, blink LED to show state X times
-    this->display_blink_led();
-  }
+  this->pending_msg_ = state ? MSG_HEAT_ON : MSG_HEAT_OFF;
 }
 
 void ComputhermQThermostat::on_pairing() {
-  if (this->initialized_) {
-    // enqueue pairing
-    this->pending_msg_ = MSG_PAIR;
-  }
+  // enqueue pairing
+  this->pending_msg_ = MSG_PAIR;
+}
+
+String ComputhermQThermostat::getjson() {
+  char lastchange_s[32];
+  sprintf(lastchange_s, "%02d/%02d/%02d %02d:%02d:%02d", 
+    year(last_change_timestamp), month(last_change_timestamp), day(last_change_timestamp), 
+    hour(last_change_timestamp), minute(last_change_timestamp), second(last_change_timestamp));
+
+  String result =
+    String("{\"state\":\"") + ONOFF(this->get_state()) + "\"" +
+    ",\"description\":\"" + String(this->get_description()) + "\"" +
+    ",\"last_change\":\"" + String(lastchange_s) + "\"" +
+    ",\"readonly\":" + TRUEFALSE(this->get_readonly()) +
+    "}";
+
+  return result;
 }
 
 ////---------- computhermqhandler ----------//
 static const unsigned int thermo_count = SECRET_THERMO_COUNT;
 static const char thermo_id[thermo_count][6] = SECRET_THERMO_IDS;
+static const char *thermo_descriptions[thermo_count] = SECRET_THERMO_DESCS;
 static const bool thermo_readonly[thermo_count] = SECRET_THERMO_READONLY;
 ComputhermQThermostat thermos[4];
 
 void computhermqhandler_setup() {
   for (int i = 0; i < thermo_count; i++) {
-    thermos[i].setup(thermo_id[i], thermo_readonly[i], i);
+    thermos[i].setup(thermo_id[i], thermo_readonly[i], i, thermo_descriptions[i]);
   }
 }
 
@@ -576,9 +741,9 @@ void computhermqhandler_loop() {
   }
 }
 
-ComputhermQThermostat* computhermqhandler_findbyid(String device_sid) {
+ComputhermQThermostat* computhermqhandler_findbyid(const char* device_sid) {
   for (int i = 0; i < thermo_count; i++) {
-    if (thermos[i].device_id() == device_sid) {
+    if (strcmp(thermos[i].get_device_id(), device_sid) == 0) {
       return &thermos[i];
     }
   }
@@ -587,8 +752,18 @@ ComputhermQThermostat* computhermqhandler_findbyid(String device_sid) {
 
 void computhermqhandler_shutdown_all_non_readonly() {
   for (int i = 0; i < thermo_count; i++) {
-    if (!thermos[i].readonly()) {
+    if (!thermos[i].get_readonly()) {
       thermos[i].set_state_update_rf(false);
     }
   }
+}
+
+String computhermqhandler_getjson() {
+  String result = "{\"thermostats\": [";
+  for (int i = 0; i < thermo_count; i++) {
+    if (i>0) result += ",";
+    result += "{\"" + String(thermos[i].get_device_id()) + "\":" + thermos[i].getjson() + "}";
+  }
+  result += "]}";
+  return result;
 }
