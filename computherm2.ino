@@ -87,20 +87,20 @@ void setup() {
   // connecting to a WiFi network
   wifihandler_setup();
   wifihandler_connect();
-  wifihandler_wait_connected();
+  //wifihandler_wait_connected();
 
   //connecting to a mqtt broker
   mqtthandler_setup(String(WiFi.macAddress()));
-  mqtthandler_ensure_connected();
-
-  // setup NTP
-  ntphandler_setup_wait_connected();
-
-  // setup thermostats
-  computhermqhandler_setup();
+  //mqtthandler_ensure_connected();
 
   // OTA handler
   otahandler_setup();
+
+  // setup NTP
+  ntphandler_setup();
+
+  // setup thermostats
+  computhermqhandler_setup();
 
   // finish setup and shut down LED
   LED(false);
@@ -110,14 +110,17 @@ void loop() {
   if (!otahandler_isupdating()) {
     wifihandler_loop();
     mqtthandler_loop();
-    rfhandler_loop();
     ntphandler_loop();
-    computhermqhandler_loop();
-    dht22handler_loop();
     otahandler_loop();
+    LEDhandler_loop();
+    
+    if (mqtthandler_connected()) {
+      rfhandler_loop();
+      computhermqhandler_loop();
+      dht22handler_loop();
+    }
   }
-
-  delay(100);
+//  delay(100);
 }
 
 ////---------- UTILITIES ----------//
@@ -125,12 +128,38 @@ void LED(bool on) {
   digitalWrite(BUILTIN_LED, on ? LOW : HIGH);
 }
 
-void LED_blink(int count) {
-  for (int i=0; i<count; i++) {
-    LED(true); delay(100);
-    LED(false); delay(50);
+const float ledhb_gamma = 0.14; // affects the width of peak (more or less darkness)
+const float ledhb_beta = 0.5; // shifts the gaussian to be symmetric
+void LED_heartbeat(int duration = 750, int max_brightness = 255) {
+  const float led_smoothness_pts = duration/5;
+  for (int ii=0;ii<led_smoothness_pts;ii++){
+    float pwm_val = (255-max_brightness) + (float)max_brightness*(1-exp(-(pow(((ii/led_smoothness_pts)-ledhb_beta)/ledhb_gamma,2.0))/2.0));
+    analogWrite(BUILTIN_LED,int(pwm_val));
+    delay(5);
   }
-  delay(300);
+  digitalWrite(BUILTIN_LED, HIGH);
+}
+
+void LED_msg_blink(int count) {
+  // one long then X short blinks
+  bool LEDStatus = false;
+  LED(true); delay(600); LED(false); delay(400); 
+  for (int i=0; i<count; i++) {
+    LED(true); delay(200); LED(false); delay(200);
+  }
+}
+
+unsigned long last_heartbeat_display_time = 0;
+void LEDhandler_loop() {
+  // heartbeat --> on error/disconnect --> continous fast pulse 
+  if (!mqtthandler_connected()) { 
+    LED_heartbeat(350, 50); 
+  }
+  // heartbeat --> normal operations --> heartbet every minute
+  else if ( calculate_diff(millis(), last_heartbeat_display_time) > 60000 ) {
+    last_heartbeat_display_time = millis();
+    LED_heartbeat(750, 50);
+  }
 }
 
 unsigned long calculate_diff(long now, long last_update) {  
@@ -209,24 +238,30 @@ NTPClient timeClient(ntpUDP);
 const long utcOffsetInSeconds = 3600;
 unsigned long ntphandler_startupTime = 0;
 
-void ntphandler_setup_wait_connected() {
+void ntphandler_setup() {
   timeClient.setTimeOffset(utcOffsetInSeconds);
   timeClient.begin();
-
-  // wait4validtime
-//  timeClient.forceUpdate();
-  Serial.print(F("Setting up NTP"));
-  while (timeClient.getEpochTime()<utcOffsetInSeconds*2) {
-    delay(100);
-    timeClient.update();
-    Serial.print(F("."));
-  }
-  Serial.println(F("\n"));
-  ntphandler_startupTime = timeClient.getEpochTime();
 }
 
 void ntphandler_loop() {
   timeClient.update();
+  
+  // start init if NTP was never inited
+  if (!ntphandler_startupTime) {
+    // wait4validtime
+    Serial.println(F("Waiting for NTP"));
+    if (!ntphandler_isvalid()) {
+      delay(100);
+      timeClient.update();
+    } else {u
+      // NTP init done - first reading is recorded as startup time
+      ntphandler_startupTime = timeClient.getEpochTime();
+    }
+  }
+}
+
+bool ntphandler_isvalid() {
+  return timeClient.getEpochTime() > utcOffsetInSeconds*2;
 }
 
 String ntphandler_getFormattedTime() {
@@ -261,11 +296,7 @@ String dht22handler_getjson() {
   float t = dht.getTemperature();
   String payload = 
     "{\"temp\":" + String(t,2) + 
-    ",\"humidity\":" + String(h,2) + 
-    ",\"uptime\":" + (int)(millis()/1000) + 
-    ",\"time\":\"" + ntphandler_getFormattedTime() + "\""
-    ",\"unixtime\":\"" + ntphandler_getEpochTime() + "\""
-    ",\"freeheap\":\"" + String(ESP.getFreeHeap()) + "\""
+    ",\"humidity\":" + String(h,2) +
     "}";
   return payload;
 }
@@ -303,9 +334,9 @@ void wifihandler_setup() {
 
   server.on("/status", [](){
     String payload = 
-      "{\"sensor\":"+dht22handler_getjson() + 
-        ","+
-        "\"computherm\":"+computhermqhandler_getjson() + 
+      "{\"status\":" + mqtthandler_getjson() + 
+      ",\"sensor\":" + dht22handler_getjson() + 
+      ",\"computherm\":" + computhermqhandler_getjson() + 
       "}";
     server.send(200, "application/json", payload);
   });
@@ -323,7 +354,7 @@ void wifihandler_setup() {
   server.begin();
 }
 
-void wifihandler_connect() {
+bool wifihandler_connect() {
   // wake up wifi if needed
   WiFi.forceSleepWake();
   delay(1);
@@ -332,6 +363,8 @@ void wifihandler_connect() {
   WiFi.hostname(PROJECT_NAME);
   WiFi.begin(wifihandler_ssid, wifihandler_password);
   Serial.println(F("WIFI connecting..."));
+
+  return wifihandler_connected();
 }
 
 void wifihandler_wait_connected() {
@@ -372,7 +405,10 @@ unsigned long mqtthandler_lastconnected = 0;
 unsigned long mqtthandler_lastconnectattempt = 0;
 bool mqtthandler_manual_shutdown_sent;
 static const long mqtthandler_connection_timeout_rf_shutdown = 60000;
+static const long mqtthandler_update_delay = 60000; //update base status every 60sec
+unsigned long mqtthandler_last_update = mqtthandler_update_delay; //to trigger instant update
 
+static const char mqtt_status_topic[] = "wifito868gw/status";
 static const char mqtt_sensor_topic[] = "wifito868gw/sensor/status";
 static const char mqtt_computherm_topic[] = "wifito868gw/computherm";
 static const char mqtt_availability_topic[] = "wifito868gw/availability";
@@ -499,15 +535,37 @@ void mqtthandler_send_sensor_update(String payload) {
   }
 }
 
+void mqtthandler_send_status_update(String payload) {
+  if (mqtthandler_connected()) {
+    Serial.printf("MQTT send status update: %s, Message: %s\n", mqtt_status_topic, payload.c_str());
+    mqtthandler_pubsubclient.publish(mqtt_status_topic, (const uint8_t*)payload.c_str(), payload.length(), false);
+  }
+}
+
+String mqtthandler_getjson() {
+  String payload = 
+    String("{\"uptime\":") + (int)(millis()/1000) + 
+    ",\"time\":\"" + ntphandler_getFormattedTime() + "\""
+    ",\"unixtime\":\"" + ntphandler_getEpochTime() + "\""
+    ",\"freeheap\":\"" + String(ESP.getFreeHeap()) + "\""
+    "}";
+  return payload;
+}
+
 void mqtthandler_loop() {
+  long now = millis();
   if (mqtthandler_connected()) {
     mqtthandler_pubsubclient.loop();
-    mqtthandler_lastconnected = millis();
-    
+    mqtthandler_lastconnected = now;
+
+    if ( calculate_diff(now, mqtthandler_last_update) > mqtthandler_update_delay ) {
+      mqtthandler_last_update = now;
+  
+      String payload = mqtthandler_getjson();
+      mqtthandler_send_status_update(payload);
+    }
+
   } else {
-    
-    long now = millis();
-    
     // reconnect in a nonblocking way
     if (calculate_diff(now, mqtthandler_lastconnectattempt) > 10000) {
       // attempt to reconnect every 10 sec
@@ -520,7 +578,12 @@ void mqtthandler_loop() {
         }
       }
       else {
-        wifihandler_connect(); //!! check if neccessary, what happens if WIFI disconnects
+        if (wifihandler_connect()) {
+          if (mqtthandler_connect()) {
+            mqtthandler_lastconnectattempt = 0;
+            return;
+          }
+        }
       }
     }
 
@@ -599,26 +662,27 @@ void ComputhermQThermostat::setup(const char* device_sid, bool readonly, int idx
 
   // Read from LittleFs
   String filename = "/"+String(this->config_device_sid_);
-  File devfile = LittleFS.open(filename, "r"); //TODO: use F() macro //!!
+  File devfile = LittleFS.open(filename, "r");
   if (devfile){
     String lastchanges = devfile.readString(); //readStringUntil, file.readbytes(buffer, length),  file.write(buffer, length) 
     last_change_timestamp = atol(lastchanges.c_str());
     devfile.close();
   }
 
-  // initialize mqtt state
-  this->set_state_update_mqtt(this->state_);
-  
   // update through RF - will be auto updated on repeat for OFF, if there is no other control
   if (!this->config_readonly_) {
     // send current state (OFF) via RF
     this->set_state_update_rf(this->state_);
   }
-
-  this->initialized_ = true;
 }
 
 void ComputhermQThermostat::update() {
+  if (!this->initialized_) {
+    this->initialized_ = true;
+    // initialize mqtt state
+    this->set_state_update_mqtt(this->state_);
+  }
+
   if (this->pending_msg_ != MSG_NONE) {
     // Send prioritized message
     this->send_msg(this->pending_msg_);
@@ -663,7 +727,7 @@ bool ComputhermQThermostat::update_state(bool newstate) {
 }
 
 void ComputhermQThermostat::display_blink_led() {
-  LED_blink(this->idx_channel_+1);
+  LED_msg_blink(this->idx_channel_+1);
 }
 
 void ComputhermQThermostat::send_msg(uint8_t msg) {
