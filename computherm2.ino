@@ -253,7 +253,7 @@ void ntphandler_loop() {
     if (!ntphandler_isvalid()) {
       delay(100);
       timeClient.update();
-    } else {u
+    } else {
       // NTP init done - first reading is recorded as startup time
       ntphandler_startupTime = timeClient.getEpochTime();
     }
@@ -405,6 +405,7 @@ unsigned long mqtthandler_lastconnected = 0;
 unsigned long mqtthandler_lastconnectattempt = 0;
 bool mqtthandler_manual_shutdown_sent;
 static const long mqtthandler_connection_timeout_rf_shutdown = 60000;
+static const long mqtthandler_connection_timeout_soft_reboot = 3600000; // 1h
 static const long mqtthandler_update_delay = 60000; //update base status every 60sec
 unsigned long mqtthandler_last_update = mqtthandler_update_delay; //to trigger instant update
 
@@ -588,12 +589,17 @@ void mqtthandler_loop() {
     }
 
     // if no MQTT connection in like 60 sec -- turn off any manual switches
-    if ((now - mqtthandler_lastconnected > mqtthandler_connection_timeout_rf_shutdown) && 
+    if ((calculate_diff(now, mqtthandler_lastconnected) > mqtthandler_connection_timeout_rf_shutdown) && 
           !mqtthandler_manual_shutdown_sent) {
       Serial.println(F("MQTT disconnection timeout - manually shutdown all non readonly thermostats"));
       mqtthandler_manual_shutdown_sent = true;
       computhermqhandler_shutdown_all_non_readonly();
     }
+    
+    // if no MQTT connection in like 1 h -- perform soft reset to retry wifi/mqtt
+    if (calculate_diff(now, mqtthandler_lastconnected) > mqtthandler_connection_timeout_soft_reboot) {
+      ESP.restart();
+    }      
   }
 }
 
