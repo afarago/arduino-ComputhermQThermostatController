@@ -1,6 +1,7 @@
 #include <Arduino.h>
 #include <ESP8266WiFi.h>
 #include <ESP8266WebServer.h>
+//#include <ESP8266mDNS.h>
 #include <WiFiUdp.h>
 #include <PubSubClient.h>
 #include <DHTesp.h>
@@ -142,7 +143,6 @@ void LED_heartbeat(int duration = 750, int max_brightness = 255) {
 
 void LED_msg_blink(int count) {
   // one long then X short blinks
-  bool LEDStatus = false;
   LED(true); delay(600); LED(false); delay(400); 
   for (int i=0; i<count; i++) {
     LED(true); delay(200); LED(false); delay(200);
@@ -332,26 +332,31 @@ void wifihandler_setup() {
 //    Serial.println("WIFI disconnected");
 //  });
 
-  server.on("/status", [](){
-    String payload = 
-      "{\"status\":" + mqtthandler_getjson() + 
-      ",\"sensor\":" + dht22handler_getjson() + 
-      ",\"computherm\":" + computhermqhandler_getjson() + 
-      "}";
-    server.send(200, "application/json", payload);
-  });
-  server.on("/sensor", [](){
-    String payload = dht22handler_getjson();
-    server.send(200, "application/json", payload);
-  });
-  server.on("/computherm", [](){
-    String payload = computhermqhandler_getjson();
-    server.send(200, "application/json", payload);
+//  if(!MDNS.begin(PROJECT_NAME)) {
+//    Serial.println("Error starting mDNS");
+//  }
+//  MDNS.addService("http", "tcp", 80);
+  
+  server.on("/", wifihandler_handleroot);
+  server.on("/status", wifihandler_handleroot);
+  server.on("/ping", [](){
+    server.send(200, "application/json", "OK: "+ ntphandler_getFormattedTime());
+    LED_heartbeat();
   });
   server.on("/restart", [](){
+    server.send(200, "application/json", "OK");
     ESP.restart();
   });
   server.begin();
+}
+
+void wifihandler_handleroot() {
+ String payload = 
+    "{\"status\":" + mqtthandler_getjson() + 
+    ",\"sensor\":" + dht22handler_getjson() + 
+    ",\"computherm\":" + computhermqhandler_getjson() + 
+    "}";
+  server.send(200, "application/json", payload);
 }
 
 bool wifihandler_connect() {
@@ -391,6 +396,7 @@ void wifihandler_disconnect() {
 
 void wifihandler_loop() {
   server.handleClient();
+//  MDNS.update();
 }
 
 ////---------- MQTT PubSubHandler ----------//
@@ -409,10 +415,11 @@ static const long mqtthandler_connection_timeout_soft_reboot = 3600000; // 1h
 static const long mqtthandler_update_delay = 60000; //update base status every 60sec
 unsigned long mqtthandler_last_update = mqtthandler_update_delay; //to trigger instant update
 
-static const char mqtt_status_topic[] = "wifito868gw/status";
-static const char mqtt_sensor_topic[] = "wifito868gw/sensor/status";
-static const char mqtt_computherm_topic[] = "wifito868gw/computherm";
-static const char mqtt_availability_topic[] = "wifito868gw/availability";
+static const char mqtt_base_t[] = "wifito868gw/";
+static String mqtt_status_topic = "/status";
+static String mqtt_sensor_topic = "/sensor/status";
+static String mqtt_computherm_topic = "/computherm";
+static String mqtt_availability_topic = "/availability";
 static const char mqtt_availability_message_offline[] = "offline";
 static const unsigned char mqtt_availability_message_online[] = "online";
 
@@ -424,6 +431,10 @@ static const char mqtt_pair_subtopic[] = "/pair";
 void mqtthandler_setup(String mac_address) {
   mqtthandler_pubsubclient.setServer(mqtt_broker, mqtt_port);
   mqtthandler_client_id = "esp8266-wifito868gw-" + mac_address;
+  mqtt_status_topic = String(mqtt_base_t) + mac_address + mqtt_status_topic;
+  mqtt_sensor_topic = String(mqtt_base_t) + mac_address + mqtt_sensor_topic;
+  mqtt_computherm_topic = String(mqtt_base_t) + mac_address + mqtt_computherm_topic;
+  mqtt_availability_topic = String(mqtt_base_t) + mac_address + mqtt_availability_topic;
 }
 
 void mqtthandler_ensure_connected() {
@@ -448,7 +459,7 @@ void mqtthandler_connect_wait() {
 
 bool mqtthandler_connect() {
   Serial.printf("MQTT connecting with client %s...\n", mqtthandler_client_id.c_str());
-  if (mqtthandler_pubsubclient.connect(mqtthandler_client_id.c_str(), mqtt_username, mqtt_password, mqtt_availability_topic, 0, false, mqtt_availability_message_offline)) {
+  if (mqtthandler_pubsubclient.connect(mqtthandler_client_id.c_str(), mqtt_username, mqtt_password, mqtt_availability_topic.c_str(), 0, false, mqtt_availability_message_offline)) {
 
     // set callback
     mqtthandler_pubsubclient.setCallback(mqtthandler_callback);
@@ -460,7 +471,7 @@ bool mqtthandler_connect() {
     mqtthandler_pubsubclient.subscribe(topicmod.c_str());
 
     // send availability message
-    mqtthandler_pubsubclient.publish(mqtt_availability_topic, mqtt_availability_message_online, sizeof(mqtt_availability_message_online)-1, true);
+    mqtthandler_pubsubclient.publish(mqtt_availability_topic.c_str(), mqtt_availability_message_online, sizeof(mqtt_availability_message_online)-1, true);
 
     // set flgs
     mqtthandler_manual_shutdown_sent = false;
@@ -487,19 +498,22 @@ void mqtthandler_sendstatus(String ttid, String payload) {
 void mqtthandler_callback(char *topic, byte *payload, unsigned int length) {
   // split ttid from: wifito868gw/computherm/8A000/control
   String topicstr = topic;
-  if (!topicstr.startsWith(mqtt_computherm_topic)) return;
-  
-  int delimiter_index = topicstr.indexOf("/", sizeof(mqtt_computherm_topic));
+  if (!topicstr.startsWith(mqtt_computherm_topic.c_str())) return;
+
+  int delimiter_index = topicstr.indexOf("/", mqtt_computherm_topic.length()+1);
   if (delimiter_index<0) return;
+//  Serial.print("[D]"); Serial.println(mqtt_computherm_topic);
+//  Serial.print("[D]"); Serial.println(mqtt_computherm_topic.length());
+//  Serial.print("[D]"); Serial.println(delimiter_index);
   
-  String ttid = topicstr.substring(sizeof(mqtt_computherm_topic), delimiter_index);
+  String ttid = topicstr.substring(mqtt_computherm_topic.length()+1, delimiter_index);
   String actionverb = topicstr.substring(delimiter_index); // include the starting "/" char as well
 
   // payload:
   payload[length] = '\0'; // Null terminator used to terminate the char array
   String message = (char*)payload;
-  Serial.printf("MQTT Message arrived in topic:[%s] action:[%s] message: [%s]\n", 
-    topicstr.c_str(), actionverb.c_str(), message.c_str());
+  Serial.printf("MQTT Message arrived in topic:[%s] ttid:[%s] action:[%s] message: [%s]\n", 
+    topicstr.c_str(), ttid.c_str(), actionverb.c_str(), message.c_str());
 
   // check if instance exists and if is not readonly otherwise skip
   ComputhermQThermostat *thermo = computhermqhandler_findbyid(ttid.c_str());
@@ -531,15 +545,15 @@ void mqtthandler_callback(char *topic, byte *payload, unsigned int length) {
 
 void mqtthandler_send_sensor_update(String payload) {
   if (mqtthandler_connected()) {
-    Serial.printf("MQTT send sensor update: %s, Message: %s\n", mqtt_sensor_topic, payload.c_str());
-    mqtthandler_pubsubclient.publish(mqtt_sensor_topic, (const uint8_t*)payload.c_str(), payload.length(), false);
+    Serial.printf("MQTT send sensor update: %s, Message: %s\n", mqtt_sensor_topic.c_str(), payload.c_str());
+    mqtthandler_pubsubclient.publish(mqtt_sensor_topic.c_str(), (const uint8_t*)payload.c_str(), payload.length(), false);
   }
 }
 
 void mqtthandler_send_status_update(String payload) {
   if (mqtthandler_connected()) {
-    Serial.printf("MQTT send status update: %s, Message: %s\n", mqtt_status_topic, payload.c_str());
-    mqtthandler_pubsubclient.publish(mqtt_status_topic, (const uint8_t*)payload.c_str(), payload.length(), false);
+    Serial.printf("MQTT send status update: %s, Message: %s\n", mqtt_status_topic.c_str(), payload.c_str());
+    mqtthandler_pubsubclient.publish(mqtt_status_topic.c_str(), (const uint8_t*)payload.c_str(), payload.length(), false);
   }
 }
 
