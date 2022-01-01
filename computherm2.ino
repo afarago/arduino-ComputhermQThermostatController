@@ -235,7 +235,8 @@ void otahandler_loop() {
 //////---------- NTP handler ----------//
 WiFiUDP ntpUDP;
 NTPClient timeClient(ntpUDP);
-const long utcOffsetInSeconds = 3600;
+const long utcOffsetInHour = 1;
+const long utcOffsetInSeconds = utcOffsetInHour*3600;
 unsigned long ntphandler_startupTime = 0;
 
 void ntphandler_setup() {
@@ -264,8 +265,21 @@ bool ntphandler_isvalid() {
   return timeClient.getEpochTime() > utcOffsetInSeconds*2;
 }
 
+String ntphandler_formatTime(long unsigned ts) {
+  char lastchange_s[32]; //!!
+  sprintf(lastchange_s, "%02d-%02d-%02dT%02d:%02d:%02d+%02d00", 
+    year(ts), month(ts), day(ts), 
+    hour(ts), minute(ts), second(ts),
+    utcOffsetInHour);
+
+  return String(lastchange_s);
+}
+
 String ntphandler_getFormattedTime() {
-  return timeClient.getFormattedTime();
+  //return timeClient.getFormattedTime();
+  long unsigned ts = ntphandler_getEpochTime();
+
+  return(ntphandler_formatTime(ts));
 }
 
 long unsigned ntphandler_getEpochTime () {
@@ -422,6 +436,7 @@ static String mqtt_computherm_topic = "/computherm";
 static String mqtt_availability_topic = "/availability";
 static const char mqtt_availability_message_offline[] = "offline";
 static const unsigned char mqtt_availability_message_online[] = "online";
+static const char mqtt_unknown_subtopic_w_slash[] = "unknown/";
 
 static const char mqtt_wildcard_wildcard[] = "/+";
 static const char mqtt_status_subtopic[] = "/status";
@@ -634,10 +649,9 @@ void rfhandler_loop() {
 
     ComputhermQThermostat *thermo = computhermqhandler_findbyid(msg.address.c_str());
     if (!thermo) {
-//      Serial.println(F("MQTT unregistered thermostat - still registering data over MQTT"));
-//      mqtthandler_sendstatus(msg.address, msg.command);
-      Serial.println(F("MQTT unregistered thermostat - skipping"));
-      
+      Serial.println(F("MQTT unregistered thermostat - still registering data over MQTT"));
+      //Serial.println(F("MQTT unregistered thermostat - skipping"));
+      mqtthandler_sendstatus(String(mqtt_unknown_subtopic_w_slash)+String(msg.address), ntphandler_getFormattedTime());
     } else {
       thermo->set_state_update_mqtt(isONOFF(msg.command.c_str()));
     }
@@ -791,15 +805,10 @@ void ComputhermQThermostat::on_pairing() {
 }
 
 String ComputhermQThermostat::getjson() {
-  char lastchange_s[32];
-  sprintf(lastchange_s, "%02d/%02d/%02d %02d:%02d:%02d", 
-    year(last_change_timestamp), month(last_change_timestamp), day(last_change_timestamp), 
-    hour(last_change_timestamp), minute(last_change_timestamp), second(last_change_timestamp));
-
   String result =
     String("{\"state\":\"") + ONOFF(this->get_state()) + "\"" +
     ",\"description\":\"" + String(this->get_description()) + "\"" +
-    ",\"last_change\":\"" + String(lastchange_s) + "\"" +
+    ",\"last_change\":\"" + String(ntphandler_formatTime(last_change_timestamp)) + "\"" +
     ",\"readonly\":" + TRUEFALSE(this->get_readonly()) +
     "}";
 
