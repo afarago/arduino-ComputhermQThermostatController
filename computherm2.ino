@@ -651,7 +651,11 @@ void rfhandler_loop() {
     if (!thermo) {
       Serial.println(F("MQTT unregistered thermostat - still registering data over MQTT"));
       //Serial.println(F("MQTT unregistered thermostat - skipping"));
-      mqtthandler_sendstatus(String(mqtt_unknown_subtopic_w_slash)+String(msg.address), ntphandler_getFormattedTime());
+      String result =
+        String("{\"state\":\"") + msg.command + "\"" +
+        ",\"last_change\":\"" + ntphandler_getFormattedTime() + "\"" +
+        "}";
+      mqtthandler_sendstatus(String(mqtt_unknown_subtopic_w_slash)+String(msg.address), result);
     } else {
       thermo->set_state_update_mqtt(isONOFF(msg.command.c_str()));
     }
